@@ -249,11 +249,23 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
           output: trivy-results.txt
+      # Same scan, machine readable: counting "CRITICAL" lines in the table counts
+      # rows, not vulnerabilities, and the reported number has to be right.
+      - name: Scan image (json)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
+          format: 'json'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          output: trivy-results.json
       - name: Summary — Trivy
         if: always()
         run: |
-          crit=$(grep -c 'CRITICAL' trivy-results.txt || true)
-          high=$(grep -c 'HIGH' trivy-results.txt || true)
+          crit=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results.json)
+          high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results.json)
           {
             echo "## Trivy"
             echo ""
@@ -261,6 +273,12 @@ jobs:
             echo "|---|---|"
             echo "| CRITICAL | ${crit} |"
             echo "| HIGH | ${high} |"
+            echo ""
+            echo "Affected packages:"
+            echo ""
+            echo '```text'
+            jq -r '[.Results[]?.Vulnerabilities[]?] | group_by(.PkgName)[] | "\(.[0].PkgName) \(.[0].InstalledVersion) -> \(.[0].FixedVersion // "no fix")  (\(length) findings)"' trivy-results.json | sort
+            echo '```'
             echo ""
             echo "<details><summary>full report</summary>"
             echo ""
