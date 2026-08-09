@@ -5,6 +5,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
+from app.cloudflare import CloudflareError
 from app.config import Config
 from app.exporter import (State, build_registry, collection_loop,
                           disabled_registry, make_handler)
@@ -118,3 +119,30 @@ def test_dashboard_json_is_valid_and_has_no_hardcoded_datasource_uid():
     # a bare label_values() string would be sent to the datasource as PromQL
     assert zone_var["query"]["qryType"] == 1
     assert zone_var["allValue"] == ".*"
+
+
+def test_a_failing_cycle_publishes_up_zero_instead_of_nothing():
+    """A bad token must be visible to the scraper, not an empty /metrics."""
+    state = State()
+    stop = threading.Event()
+
+    class Failing(FakeClient):
+        def list_zones(self, only=None):
+            self.errors += 1
+            raise CloudflareError("HTTP Error 400: Bad Request")
+
+    thread = threading.Thread(
+        target=collection_loop,
+        args=(state, Config({"INTERVAL": "0"}), Failing()),
+        kwargs={"stop": stop}, daemon=True)
+    thread.start()
+    for _ in range(200):
+        if state.ready:
+            break
+        threading.Event().wait(0.01)
+    stop.set()
+    thread.join(timeout=5)
+    payload = state.get()
+    assert "cloudflare_exporter_up 0" in payload
+    assert 'cloudflare_exporter_disabled_info{reason="collection_failed"} 1' in payload
+    assert state.ready is True  # readiness means "an attempt completed", not "Cloudflare is up"

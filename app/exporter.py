@@ -59,10 +59,18 @@ def build_registry(client, zones, accounts, config, now=None):
     return registry
 
 
-def disabled_registry(reason):
+def disabled_registry(reason, api_errors=0):
+    """Exposition published when collection is impossible or failing.
+
+    Serving `cloudflare_exporter_up 0` beats serving nothing: a broken token or a
+    Cloudflare outage must be visible to the scraper and alertable, and the pod must
+    still become Ready so it is not silently restarted forever.
+    """
     registry = Registry()
     registry.add("cloudflare_exporter_up",
                  "1 when the last cycle completed", "gauge", [({}, 0)])
+    registry.add("cloudflare_exporter_api_errors_total",
+                 "Cloudflare API errors since start", "counter", [({}, api_errors)])
     registry.add("cloudflare_exporter_disabled_info",
                  "Present when the exporter is not collecting; reason in the label",
                  "gauge", [({"reason": reason}, 1)])
@@ -114,8 +122,13 @@ def collection_loop(state, config, client, stop=None):
             state.set(build_registry(client, zones, accounts, config).text())
         except CloudflareError as exc:
             log.error("collection cycle failed: %s", exc)
+            # Publish the failure instead of leaving the previous payload (or the
+            # startup placeholder) in place: a stale success would hide the outage.
+            state.set(disabled_registry("collection_failed", client.errors).text())
+            zones = []  # rediscover on the next cycle, the token may have changed
         except Exception:  # keep the thread alive whatever happens
             log.exception("unexpected error in collection cycle")
+            state.set(disabled_registry("unexpected_error", client.errors).text())
         if stop and stop.wait(config.interval):
             return
         if not stop:
