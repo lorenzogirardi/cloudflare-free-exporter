@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: lgirardi/cloudflare-free-exporter
-  tag: "v1.0.1"
+  tag: "v1.0.2"
   pullPolicy: IfNotPresent
 
 nameOverride: ""
