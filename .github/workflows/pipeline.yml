@@ -97,8 +97,13 @@ jobs:
 
   docker:
     needs: build
-    # Forks and PRs have no registry credentials: build only, never push.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # The secrets context cannot be used in a step `if:`; expose it as env.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -111,20 +116,44 @@ jobs:
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      - name: Login to DockerHub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # GHCR always works with the built-in token. Docker Hub is optional: without
+      # DOCKERHUB_* the pipeline still publishes, it just skips that registry
+      # instead of failing with "Username and password required".
       - name: Login to GitHub Packages
         if: github.event_name != 'pull_request'
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GIT_TOKEN }}
-      - name: Build image and push to Docker Hub and GHCR
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Login to DockerHub
+        id: dockerhub
+        if: github.event_name != 'pull_request' && env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Compose the tag list
+        id: tags
+        run: |
+          set -euo pipefail
+          {
+            echo "tags<<EOF"
+            echo "${GHCR}:${TAG}"
+            echo "${GHCR}:latest"
+            if [ -n "${DOCKERHUB_USER}" ]; then
+              echo "${IMAGE}:${TAG}"
+              echo "${IMAGE}:latest"
+            else
+              echo "::notice::DOCKERHUB_USERNAME not set, publishing to GHCR only" >&2
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ needs.build.outputs.image_tag }}
+          GHCR: ghcr.io/${{ github.repository_owner }}/cloudflare-free-exporter
+          DOCKERHUB_USER: ${{ env.DOCKERHUB_USERNAME }}
+      - name: Build image and push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -132,25 +161,34 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: |
-            ${{ env.IMAGE }}:${{ needs.build.outputs.image_tag }}
-            ${{ env.IMAGE }}:latest
-            ghcr.io/${{ github.repository_owner }}/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
+          tags: ${{ steps.tags.outputs.tags }}
 
   security-gate-trivy:
-    needs: [build, docker]
-    if: github.event_name != 'pull_request'
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: audit
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      # Scans the image built from the same layers as the published one, loaded
+      # locally: no registry pull, so this also runs on PRs and on forks.
+      - name: Build image locally for scanning
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          cache-from: type=gha
+          load: true
+          tags: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         id: scan
         with:
-          image-ref: ${{ env.IMAGE }}:${{ needs.build.outputs.image_tag }}
+          image-ref: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
           format: 'table'
           exit-code: '0'
           ignore-unfixed: true
@@ -176,12 +214,23 @@ jobs:
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: audit
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build image locally for the SBOM
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          cache-from: type=gha
+          load: true
+          tags: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
       - name: SBOM image
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         continue-on-error: true
         id: sbom
         with:
-          image: ${{ env.IMAGE }}:${{ needs.build.outputs.image_tag }}
+          image: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
           output-file: "${{ github.event.repository.name }}-sbom.spdx.json"
 
   quality-gate:
@@ -225,6 +274,8 @@ jobs:
     needs: [build, docker, quality-gate]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -245,7 +296,8 @@ jobs:
           git commit -m "ci: pin image ${IMAGE_TAG} (run ${{ github.run_number }})"
           git push origin main
         env:
-          GITHUB_TOKEN: ${{ secrets.GIT_TOKEN }}
+          # actions/checkout persisted the built-in token; `contents: write` above
+          # is what makes the push work, no extra PAT needed.
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
 
   k8s-check:
@@ -259,21 +311,35 @@ jobs:
           egress-policy: audit
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          cache-from: type=gha
+          load: true
+          tags: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
       - name: Testing on a k8s Kind Cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
       - run: |
           kubectl cluster-info
           kubectl get nodes
+      - name: Load the image into kind
+        # Side-loading keeps this gate independent from registry visibility and
+        # credentials; it tests the same image the docker job published.
+        run: kind load docker-image local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }} --name chart-testing
       - name: Install the chart with a dummy token
         # No Cloudflare credentials in CI: the exporter must still start and serve
         # /metrics and /healthz, reporting cloudflare_exporter_up 0.
         run: |
           set -euo pipefail
           helm install cf ./helm/cloudflare-free-exporter \
+            --set image.repository=local/cloudflare-free-exporter \
             --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --set image.pullPolicy=IfNotPresent \
             --set cloudflare.create=true \
             --set-string cloudflare.token=ci-dummy-token \
-            --set readinessProbeDisabled=true \
             --wait --timeout 180s || true
           kubectl get pods -o wide
       - name: Probe the deployed exporter
