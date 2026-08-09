@@ -14,6 +14,10 @@ permissions:
 
 env:
   IMAGE: lgirardi/cloudflare-free-exporter
+  # The per-job "Docker Build summary" blocks say nothing about the run; each job
+  # writes its own tool result to $GITHUB_STEP_SUMMARY instead.
+  DOCKER_BUILD_SUMMARY: "false"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
   build:
@@ -67,6 +71,26 @@ jobs:
         run: |
           set -o pipefail
           python3 scripts/check_dashboard.py 2>&1 | tee .ai/dashboard-check.txt
+      - name: Summary — lint, tests, dashboard
+        if: always()
+        run: |
+          {
+            echo "## Build"
+            echo ""
+            echo "| Tool | Result |"
+            echo "|---|---|"
+            printf "| flake8 (errors) | %s |\n" "$(tail -1 .ai/lint-errors.txt 2>/dev/null || echo n/a)"
+            printf "| flake8 (style) | %s findings |\n" "$(tail -1 .ai/lint.txt 2>/dev/null || echo n/a)"
+            printf "| pytest | %s |\n" "$(grep -oE '[0-9]+ (passed|failed)([^|]*)' .ai/tests.txt | tail -1)"
+            printf "| dashboard check | %s |\n" "$(grep -E '^(OK|ERROR)' .ai/dashboard-check.txt | head -1)"
+            echo ""
+            echo "<details><summary>pytest output</summary>"
+            echo ""
+            echo '```text'
+            tail -25 .ai/tests.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload AI context (lint results)
         if: always() && vars.AI_ENABLED == 'true'
         uses: actions/upload-artifact@v4
@@ -174,6 +198,24 @@ jobs:
           platforms: linux/amd64
           tags: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
           outputs: type=docker,dest=/tmp/image.tar
+      - name: Summary — published image
+        if: always()
+        run: |
+          {
+            echo "## Image"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            printf "| tag | \`%s\` |\n" "${{ needs.build.outputs.image_tag }}"
+            printf "| platforms | linux/amd64, linux/arm64 |\n"
+            printf "| pushed | %s |\n" "${{ github.event_name != 'pull_request' }}"
+            printf "| local tarball | %s |\n" "$(du -h /tmp/image.tar | cut -f1)"
+            echo ""
+            echo "Registries:"
+            echo '```text'
+            echo "${{ steps.tags.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the image tarball
         uses: actions/upload-artifact@v4
         with:
@@ -207,6 +249,26 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
           output: trivy-results.txt
+      - name: Summary — Trivy
+        if: always()
+        run: |
+          crit=$(grep -c 'CRITICAL' trivy-results.txt || true)
+          high=$(grep -c 'HIGH' trivy-results.txt || true)
+          {
+            echo "## Trivy"
+            echo ""
+            echo "| Severity | Findings |"
+            echo "|---|---|"
+            echo "| CRITICAL | ${crit} |"
+            echo "| HIGH | ${high} |"
+            echo ""
+            echo "<details><summary>full report</summary>"
+            echo ""
+            echo '```text'
+            head -120 trivy-results.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload AI context (trivy scan)
         if: always() && vars.AI_ENABLED == 'true'
         uses: actions/upload-artifact@v4
@@ -240,6 +302,38 @@ jobs:
         with:
           image: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
           output-file: "${{ github.event.repository.name }}-sbom.spdx.json"
+      - name: Summary — SBOM
+        if: always()
+        run: |
+          f="${{ github.event.repository.name }}-sbom.spdx.json"
+          {
+            echo "## SBOM"
+            echo ""
+            if [ -s "$f" ]; then
+              echo "| Field | Value |"
+              echo "|---|---|"
+              echo "| format | SPDX JSON |"
+              echo "| packages | $(jq '.packages | length' "$f") |"
+              echo "| size | $(du -h "$f" | cut -f1) |"
+              echo ""
+              echo "<details><summary>packages</summary>"
+              echo ""
+              echo '```text'
+              jq -r '.packages[] | "\(.name) \(.versionInfo // "")"' "$f" | sort | head -60
+              echo '```'
+              echo "</details>"
+            else
+              echo "no SBOM produced"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: "${{ github.event.repository.name }}-sbom.spdx.json"
+          if-no-files-found: ignore
+          retention-days: 7
 
   quality-gate:
     needs: build
@@ -268,6 +362,29 @@ jobs:
           output_format: sarif
           soft_fail: true
           quiet: true
+      - name: Summary — Helm and Checkov
+        if: always()
+        run: |
+          {
+            echo "## Helm chart"
+            echo ""
+            echo "| Tool | Result |"
+            echo "|---|---|"
+            echo "| helm lint | $(helm lint ./helm/cloudflare-free-exporter 2>&1 | tail -1) |"
+            echo "| helm template | $(wc -l < /tmp/rendered.yaml) lines rendered |"
+            if [ -s results.sarif ]; then
+              echo "| checkov | $(jq '[.runs[].results[]] | length' results.sarif) failed checks |"
+              echo ""
+              echo "<details><summary>checkov findings</summary>"
+              echo ""
+              echo '```text'
+              jq -r '.runs[].results[] | "\(.ruleId)  \(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)  \(.message.text)"' results.sarif
+              echo '```'
+              echo "</details>"
+            else
+              echo "| checkov | no sarif produced |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload AI context (checkov results)
         if: always() && vars.AI_ENABLED == 'true'
         uses: actions/upload-artifact@v4
@@ -307,6 +424,17 @@ jobs:
           # actions/checkout persisted the built-in token; `contents: write` above
           # is what makes the push work, no extra PAT needed.
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+
+      - name: Summary — chart pin
+        if: always()
+        run: |
+          {
+            echo "## Chart image pin"
+            echo ""
+            echo '```text'
+            grep -A2 '^image:' helm/cloudflare-free-exporter/values.yaml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   k8s-check:
     needs: [build, docker]
@@ -374,6 +502,28 @@ jobs:
             echo "::error::/metrics did not expose cloudflare_exporter_up"
             exit 1
           fi
+      - name: Summary — kind deployment probe
+        if: always()
+        run: |
+          {
+            echo "## Kubernetes smoke test (kind)"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            printf "| /healthz | %s |\n" "$(grep -oE 'HTTP [0-9]+' k8s-probe.txt | tail -1)"
+            printf "| pod | %s |\n" "$(grep -m1 'cf-cloudflare-free-exporter' k8s-probe.txt | awk '{print $2, $3}')"
+            printf "| exporter_up | %s |\n" "$(grep -oE 'cloudflare_exporter_up [0-9]+' k8s-probe.txt | tail -1 | awk '{print $2}')"
+            echo ""
+            echo "The dummy token makes every Cloudflare call fail on purpose: the gate"
+            echo "checks that the exporter still serves /metrics and reports up 0."
+            echo ""
+            echo "<details><summary>probe output</summary>"
+            echo ""
+            echo '```text'
+            cat k8s-probe.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload AI context (k8s probe)
         if: always() && vars.AI_ENABLED == 'true'
         uses: actions/upload-artifact@v4
