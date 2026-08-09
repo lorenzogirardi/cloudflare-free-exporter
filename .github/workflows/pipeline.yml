@@ -162,28 +162,40 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
+      # A multi-arch manifest cannot be loaded into a local docker daemon, so the
+      # amd64 variant is exported once as a tarball and handed to Trivy, the SBOM
+      # and the kind test. That keeps the gates independent from registry
+      # visibility without each of them rebuilding the same image.
+      - name: Export the amd64 image for the downstream gates
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          cache-from: type=gha
+          platforms: linux/amd64
+          tags: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
+          outputs: type=docker,dest=/tmp/image.tar
+      - name: Upload the image tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tar
+          path: /tmp/image.tar
+          retention-days: 1
 
   security-gate-trivy:
-    needs: build
+    needs: [build, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: audit
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      # Scans the image built from the same layers as the published one, loaded
-      # locally: no registry pull, so this also runs on PRs and on forks.
-      - name: Build image locally for scanning
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - name: Download the image built by the docker job
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          cache-from: type=gha
-          load: true
-          tags: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
+          name: image-tar
+          path: /tmp
+      - name: Load the image
+        run: docker load -i /tmp/image.tar
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         id: scan
@@ -206,7 +218,7 @@ jobs:
           retention-days: 1
 
   docker-sbom:
-    needs: [build, security-gate-trivy]
+    needs: [build, docker]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -214,17 +226,13 @@ jobs:
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: audit
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      - name: Build image locally for the SBOM
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - name: Download the image built by the docker job
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          cache-from: type=gha
-          load: true
-          tags: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
+          name: image-tar
+          path: /tmp
+      - name: Load the image
+        run: docker load -i /tmp/image.tar
       - name: SBOM image
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         continue-on-error: true
@@ -311,15 +319,13 @@ jobs:
           egress-policy: audit
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      - name: Build image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - name: Download the image built by the docker job
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          cache-from: type=gha
-          load: true
-          tags: local/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
+          name: image-tar
+          path: /tmp
+      - name: Load the image
+        run: docker load -i /tmp/image.tar
       - name: Testing on a k8s Kind Cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
       - run: |
