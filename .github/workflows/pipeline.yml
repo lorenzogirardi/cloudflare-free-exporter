@@ -1,0 +1,458 @@
+name: Build pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  security-events: write
+  actions: read
+
+env:
+  IMAGE: lgirardi/cloudflare-free-exporter
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.version.outputs.image_tag }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Derive image tag
+        id: version
+        # MAJOR.MINOR comes from pyproject.toml (single source of truth); PATCH is the
+        # run number so every build gets a unique, monotonic v<major>.<minor>.<n> tag.
+        run: |
+          set -euo pipefail
+          base=$(grep -oE '^version[[:space:]]*=[[:space:]]*"[0-9]+\.[0-9]+' pyproject.toml \
+                 | grep -oE '[0-9]+\.[0-9]+$')
+          if [ -z "$base" ]; then echo "::error::could not parse version from pyproject.toml"; exit 1; fi
+          tag="v${base}.${GITHUB_RUN_NUMBER}"
+          echo "image_tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "image tag: ${tag}"
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pytest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Lint with flake8
+        id: lint
+        run: |
+          set -o pipefail
+          mkdir -p .ai
+          # hard gate: syntax errors and undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics 2>&1 | tee .ai/lint-errors.txt
+          # informative: style and complexity
+          flake8 . --count --exit-zero --max-complexity=15 --max-line-length=110 --statistics 2>&1 | tee -a .ai/lint.txt
+      - name: Run tests
+        id: tests
+        run: |
+          set -o pipefail
+          pytest tests/ -v 2>&1 | tee .ai/tests.txt
+      - name: Validate the Grafana dashboard against the exported metric names
+        # Catches the classic drift: a metric renamed in the exporter while the
+        # dashboard still queries the old name, which shows up as silent "No data".
+        run: |
+          set -o pipefail
+          python3 scripts/check_dashboard.py 2>&1 | tee .ai/dashboard-check.txt
+      - name: Upload AI context (lint results)
+        if: always() && vars.AI_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-context-lint
+          path: .ai/lint-errors.txt
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 1
+      - name: Upload AI context (tests results)
+        if: always() && vars.AI_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-context-tests
+          path: .ai/tests.txt
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 1
+      - name: Upload AI context (dashboard check)
+        if: always() && vars.AI_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-context-dashboard
+          path: .ai/dashboard-check.txt
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 1
+
+  docker:
+    needs: build
+    # Forks and PRs have no registry credentials: build only, never push.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GitHub Packages
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GIT_TOKEN }}
+      - name: Build image and push to Docker Hub and GHCR
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.build.outputs.image_tag }}
+            ${{ env.IMAGE }}:latest
+            ghcr.io/${{ github.repository_owner }}/cloudflare-free-exporter:${{ needs.build.outputs.image_tag }}
+
+  security-gate-trivy:
+    needs: [build, docker]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        id: scan
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ needs.build.outputs.image_tag }}
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          output: trivy-results.txt
+      - name: Upload AI context (trivy scan)
+        if: always() && vars.AI_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-context-trivy
+          path: trivy-results.txt
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 1
+
+  docker-sbom:
+    needs: [build, security-gate-trivy]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: SBOM image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        continue-on-error: true
+        id: sbom
+        with:
+          image: ${{ env.IMAGE }}:${{ needs.build.outputs.image_tag }}
+          output-file: "${{ github.event.repository.name }}-sbom.spdx.json"
+
+  quality-gate:
+    needs: build
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.1
+      - name: Helm lint and template
+        run: |
+          helm lint ./helm/cloudflare-free-exporter
+          helm template ci ./helm/cloudflare-free-exporter > /tmp/rendered.yaml
+          wc -l /tmp/rendered.yaml
+      - name: Checkov GitHub Action
+        uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
+        id: checkov
+        with:
+          framework: helm
+          directory: ./helm/
+          output_format: sarif
+          soft_fail: true
+          quiet: true
+      - name: Upload AI context (checkov results)
+        if: always() && vars.AI_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-context-checkov
+          path: results.sarif
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 1
+
+  modifygit:
+    needs: [build, docker, quality-gate]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Pin the freshly built image in the chart
+        run: |
+          set -euo pipefail
+          git config user.email l@k8s.it
+          git config user.name l
+          cd helm/cloudflare-free-exporter/
+          sed -i "s+tag:.*+tag: \"$IMAGE_TAG\"+g" values.yaml
+          grep -A2 '^image:' values.yaml
+          git add values.yaml
+          git diff --cached --quiet && { echo "chart already on $IMAGE_TAG"; exit 0; }
+          git commit -m "ci: pin image ${IMAGE_TAG} (run ${{ github.run_number }})"
+          git push origin main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GIT_TOKEN }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+
+  k8s-check:
+    needs: [build, docker]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Testing on a k8s Kind Cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+      - run: |
+          kubectl cluster-info
+          kubectl get nodes
+      - name: Install the chart with a dummy token
+        # No Cloudflare credentials in CI: the exporter must still start and serve
+        # /metrics and /healthz, reporting cloudflare_exporter_up 0.
+        run: |
+          set -euo pipefail
+          helm install cf ./helm/cloudflare-free-exporter \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --set cloudflare.create=true \
+            --set-string cloudflare.token=ci-dummy-token \
+            --set readinessProbeDisabled=true \
+            --wait --timeout 180s || true
+          kubectl get pods -o wide
+      - name: Probe the deployed exporter
+        run: |
+          set +e
+          echo "-- Probe: GET /healthz and /metrics on the chart's Service --" > k8s-probe.txt
+          kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=cloudflare-free-exporter --timeout=120s >> k8s-probe.txt 2>&1
+          kubectl port-forward svc/cf-cloudflare-free-exporter 8080:8080 &>/dev/null &
+          sleep 5
+          code=000
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/healthz)
+            echo "attempt $i: /healthz HTTP ${code}" >> k8s-probe.txt
+            if [[ "$code" =~ ^2 ]]; then break; fi
+            sleep 5
+          done
+          echo "-- /metrics head --" >> k8s-probe.txt
+          curl -s http://localhost:8080/metrics | head -20 >> k8s-probe.txt
+          kubectl get po -o wide >> k8s-probe.txt 2>&1
+          kubectl logs -l app.kubernetes.io/name=cloudflare-free-exporter --tail=30 >> k8s-probe.txt 2>&1
+          if [[ ! "$code" =~ ^2 ]]; then
+            echo "::error::exporter did not answer /healthz with 2xx (got ${code})"
+            exit 1
+          fi
+          if ! curl -s http://localhost:8080/metrics | grep -q 'cloudflare_exporter_up'; then
+            echo "::error::/metrics did not expose cloudflare_exporter_up"
+            exit 1
+          fi
+      - name: Upload AI context (k8s probe)
+        if: always() && vars.AI_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-context-k8s
+          path: k8s-probe.txt
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 1
+
+  # Informative AI job: runs AFTER the deterministic gates so it can also review
+  # their outputs (trivy scan, checkov results, k8s probe) as additional context,
+  # on top of lint + tests + exporter source.
+  # It never overrides deterministic gates — those keep today's behavior.
+  ai-analysis:
+    needs: [build, docker, security-gate-trivy, docker-sbom, quality-gate, modifygit, k8s-check]
+    # always() so failures are still analyzed; vars.AI_ENABLED toggles the feature.
+    if: always() && vars.AI_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+      OPENROUTER_ENDPOINT: ${{ vars.OPENROUTER_ENDPOINT }}
+      OPENROUTER_SITE_URL: ${{ vars.OPENROUTER_SITE_URL }}
+      OPENROUTER_APP_NAME: ${{ vars.OPENROUTER_APP_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download AI context artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: .ai/
+          pattern: 'ai-context-*'
+          merge-multiple: true
+          if-no-files-found: warn
+      - name: Sanitize contexts and build prompt
+        run: |
+          mkdir -p .ai
+          [ -s .ai/lint-errors.txt ] || echo "no lint output available" > .ai/lint-errors.txt
+          [ -s .ai/tests.txt ] || echo "no test output available" > .ai/tests.txt
+          # Bundle the exporter source so the AI can review logic (token handling,
+          # cardinality, API error handling), not just a static snapshot of CI output.
+          find app scripts -name '*.py' -print0 | sort -z > /tmp/srclist
+          if [ -s /tmp/srclist ]; then
+            python3 scripts/ai_sanitize.py \
+              --out .ai/source-context.txt \
+              --max-bytes 60000 \
+              $(xargs -0 < /tmp/srclist) || rm -f .ai/source-context.txt
+          fi
+          python3 scripts/ai_sanitize.py \
+            --out .ai/security-context.txt \
+            --max-bytes 120000 \
+            .ai/lint-errors.txt .ai/tests.txt .ai/dashboard-check.txt .ai/source-context.txt \
+            .ai/trivy-results.txt .ai/results.sarif .ai/k8s-probe.txt || rm -f .ai/security-context.txt
+      - name: Create AI analysis prompt
+        shell: bash
+        run: |
+          cat > .ai/analysis-system.txt <<'EOF'
+          You are a QA/DevOps/security analyst. You are given the CI output of a full
+          pipeline (lint, tests, dashboard check, container scan, helm/IaC checks, K8s
+          probe) and the source of a Prometheus exporter that reads the Cloudflare API.
+          ALL the data you need is in the prompt below. Treat it as ground truth: do not
+          guess, compute, or hedge.
+
+          RULES:
+          - Be direct and concise. Output the report only; no chain-of-thought.
+          - Cite evidence for every claim: exact test counts as printed, file paths and
+            line numbers for code findings, CVE ids and Checkov rule ids as printed.
+          - Pointed suggestions: for each issue give a concrete actionable fix:
+            "in <file>:<line>, change X to Y because <reason>". No abstract advice.
+          - No hedging: ban words like "I think", "likely", "maybe", "let me count".
+            If the data is ambiguous, say which value the context reports and stop;
+            never invent numbers.
+
+          Produce a technical report in Markdown with:
+          - **Summary**: pipeline outcome, lint errors by kind/file, test
+            pass/fail/skip counts exactly as printed, container/IaC/k8s findings with ids.
+          - **High severity issues** (anything likely to break behavior), each with
+            file:line and the minimal fix.
+          - **Failures / flaky tests** (report only what appears).
+          - **Security review** of the exporter source: API token leakage into logs,
+            metric labels or error messages; SSRF through configurable API base URLs;
+            unbounded metric cardinality (label values coming from user-controlled data
+            such as hostnames, paths, query names); crash loops on malformed API
+            responses; secrets baked into the image or the Helm chart.
+          - **Operational review**: Cloudflare rate limit budget (300 requests / 5 min)
+            versus the configured interval and number of zones; behavior when a dataset
+            is refused by the plan; staleness of gauges when the API is down.
+          - **Code style / maintainability issues** (low severity).
+          - **False positives** (note any code that looks alarming but is safe).
+          - **Concrete suggestions**: numbered, each with file:line + exact change.
+          The report is INFORMATIVE only - it never changes the pipeline result.
+          EOF
+          cat > .ai/analysis-user.txt <<'EOF'
+          Repository event: ${{ github.event_name }}
+          Branch: ${{ github.ref_name }}
+          Source: flake8 + pytest output + gate outputs + exporter source
+          EOF
+          echo "== CI OUTPUT + SOURCE + GATE RESULTS ==" >> .ai/analysis-user.txt
+          cat .ai/security-context.txt >> .ai/analysis-user.txt
+      - name: Run AI analysis
+        if: env.OPENROUTER_API_KEY != ''
+        run: |
+          python3 scripts/openrouter_ai.py \
+            --system-file .ai/analysis-system.txt \
+            --prompt-file .ai/analysis-user.txt \
+            --max-chars 150000 \
+            --max-tokens 32000 \
+            --timeout 300 \
+            --usage-file .ai/usage.json \
+            > .ai/ai-report.md
+      - name: Append token usage & cost to report
+        if: env.OPENROUTER_API_KEY != ''
+        run: |
+          python3 scripts/ai_append_cost.py \
+            --usage-file .ai/usage.json \
+            --report-file .ai/ai-report.md
+      - name: Mask secrets in report before upload
+        if: env.OPENROUTER_API_KEY != ''
+        run: |
+          python3 scripts/ai_sanitize.py --redact-file .ai/ai-report.md \
+            >/dev/null 2>&1 || echo "::warning::AI report contained secret-like patterns, they have been masked"
+      - name: Show tests results in pipeline summary
+        run: |
+          {
+            echo "## 🧪 Tests"
+            echo ""
+            echo '```text'
+            if [ -s .ai/tests.txt ]; then tail -40 .ai/tests.txt; else echo "no test output"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Show AI analysis in pipeline summary
+        if: env.OPENROUTER_API_KEY != ''
+        run: |
+          echo "::group::🤖 AI Analysis Report"
+          cat .ai/ai-report.md
+          echo "::endgroup::"
+          {
+            echo "## 🤖 AI Analysis Report"
+            echo ""
+            cat .ai/ai-report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload AI analysis report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-analysis-report
+          path: .ai/ai-report.md
+          if-no-files-found: ignore
+          retention-days: 7

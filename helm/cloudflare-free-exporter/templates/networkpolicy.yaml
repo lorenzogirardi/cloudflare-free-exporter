@@ -1,0 +1,35 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "cloudflare-free-exporter.fullname" . }}
+  labels:
+    {{- include "cloudflare-free-exporter.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "cloudflare-free-exporter.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only the scraper may reach /metrics.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.scrapeNamespace }}
+      ports:
+        - port: metrics
+          protocol: TCP
+  egress:
+    # DNS + HTTPS to api.cloudflare.com. Egress is not restricted by IP because
+    # Cloudflare's API is anycast and the address set changes.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 443
+          protocol: TCP
+{{- end }}

@@ -1,0 +1,2 @@
+# Runtime: standard library only (urllib, http.server, threading).
+# Dev/CI dependencies are installed by the pipeline: flake8, pytest.

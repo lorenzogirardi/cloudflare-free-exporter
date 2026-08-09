@@ -1,0 +1,13 @@
+[project]
+name = "cloudflare-free-exporter"
+version = "1.0.0"
+description = "Prometheus exporter for the Cloudflare metrics available on a free plan"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 110
+target-version = ["py311"]

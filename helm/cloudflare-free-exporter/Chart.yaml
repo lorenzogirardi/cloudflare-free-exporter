@@ -1,0 +1,13 @@
+apiVersion: v2
+name: cloudflare-free-exporter
+description: Prometheus exporter for the Cloudflare metrics available on a free plan
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+home: https://github.com/lorenzogirardi/cloudflare-free-exporter
+sources:
+  - https://github.com/lorenzogirardi/cloudflare-free-exporter
+keywords:
+  - cloudflare
+  - prometheus
+  - exporter
