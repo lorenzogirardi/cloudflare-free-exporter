@@ -1,11 +1,11 @@
 {
   "uid": "cf-edge-free",
   "title": "Cloudflare Edge (free plan)",
-  "description": "Everything the Cloudflare free plan exposes: edge traffic at 1-minute resolution, DNS analytics, WAF events, daily rollups and tunnel health. Fed by cloudflare-free-exporter -> any Prometheus-compatible store.",
+  "description": "Everything the Cloudflare free plan exposes: edge traffic at 1-minute resolution, DNS analytics, WAF events, daily rollups and tunnel health. Fed by cf-graphql-exporter (ns cloudflare-exp on izanagi) -> VictoriaMetrics.",
   "tags": [
     "cloudflare",
-    "edge",
-    "exporter"
+    "izanagi",
+    "edge"
   ],
   "timezone": "browser",
   "schemaVersion": 42,
@@ -118,7 +118,7 @@
     },
     {
       "type": "stat",
-      "title": "Error ratio (5xx)",
+      "title": "Origin error ratio (5xx, excl. 530)",
       "id": 3,
       "datasource": {
         "type": "prometheus",
@@ -136,7 +136,7 @@
             "type": "prometheus",
             "uid": "${DS}"
           },
-          "expr": "sum(cloudflare_zone_requests_per_minute{zone=~\"$zone\",status=~\"5..\"}) / clamp_min(sum(cloudflare_zone_requests_per_minute{zone=~\"$zone\"}), 1)",
+          "expr": "(sum(cloudflare_zone_requests_per_minute{zone=~\"$zone\",status=~\"5..\",status!=\"530\"}) or vector(0)) / clamp_min(sum(cloudflare_zone_requests_per_minute{zone=~\"$zone\"}), 1)",
           "legendFormat": "5xx",
           "refId": "A",
           "instant": true,
@@ -166,11 +166,12 @@
           }
         },
         "overrides": []
-      }
+      },
+      "description": "Real origin failures. Cloudflare-generated 530 (tunnel unreachable) is excluded and tracked separately."
     },
     {
       "type": "stat",
-      "title": "Edge bytes / min",
+      "title": "Tunnel unreachable (530) / min",
       "id": 4,
       "datasource": {
         "type": "prometheus",
@@ -188,8 +189,8 @@
             "type": "prometheus",
             "uid": "${DS}"
           },
-          "expr": "sum(cloudflare_zone_bytes_per_minute{zone=~\"$zone\"})",
-          "legendFormat": "bytes",
+          "expr": "sum(cloudflare_zone_requests_per_minute{zone=~\"$zone\",status=\"530\"}) or vector(0)",
+          "legendFormat": "530",
           "refId": "A",
           "instant": true,
           "range": false
@@ -197,7 +198,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "bytes",
+          "unit": "reqpm",
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -205,12 +206,17 @@
               {
                 "color": "green",
                 "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
               }
             ]
           }
         },
         "overrides": []
-      }
+      },
+      "description": "Cloudflare error 1033: the hostname is routed to a tunnel with no connector, so the request never reaches an origin. Check cloudflare_tunnel_healthy."
     },
     {
       "type": "stat",
@@ -262,7 +268,7 @@
     },
     {
       "type": "stat",
-      "title": "WAF events / 24h",
+      "title": "Edge bytes / min",
       "id": 6,
       "datasource": {
         "type": "prometheus",
@@ -270,7 +276,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 2,
         "x": 16,
         "y": 1
       },
@@ -280,7 +286,51 @@
             "type": "prometheus",
             "uid": "${DS}"
           },
-          "expr": "sum(cloudflare_firewall_events_24h_total{zone=~\"$zone\"})",
+          "expr": "sum(cloudflare_zone_bytes_per_minute{zone=~\"$zone\"})",
+          "legendFormat": "bytes",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "WAF / 24h",
+      "id": 7,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 2,
+        "x": 18,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "sum(cloudflare_firewall_events_24h_total{zone=~\"$zone\"}) or vector(0)",
           "legendFormat": "events",
           "refId": "A",
           "instant": true,
@@ -307,7 +357,7 @@
     {
       "type": "stat",
       "title": "Cache hit ratio (1h)",
-      "id": 7,
+      "id": 8,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -324,7 +374,7 @@
             "type": "prometheus",
             "uid": "${DS}"
           },
-          "expr": "sum(cloudflare_zone_requests_1h_by_cache_status{zone=~\"$zone\",cache_status=~\"hit|stale|updating|revalidated\"}) / clamp_min(sum(cloudflare_zone_requests_1h_by_cache_status{zone=~\"$zone\"}), 1)",
+          "expr": "(sum(cloudflare_zone_requests_1h_by_cache_status{zone=~\"$zone\",cache_status=~\"hit|stale|updating|revalidated\"}) or vector(0)) / clamp_min(sum(cloudflare_zone_requests_1h_by_cache_status{zone=~\"$zone\"}), 1)",
           "legendFormat": "hit",
           "refId": "A",
           "instant": true,
@@ -351,7 +401,7 @@
     {
       "type": "row",
       "title": "Traffic (edge, 1-minute resolution)",
-      "id": 8,
+      "id": 9,
       "collapsed": false,
       "panels": [],
       "gridPos": {
@@ -364,7 +414,7 @@
     {
       "type": "timeseries",
       "title": "Requests per minute by status",
-      "id": 9,
+      "id": 10,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -416,7 +466,7 @@
     {
       "type": "timeseries",
       "title": "Requests per minute by zone",
-      "id": 10,
+      "id": 11,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -460,7 +510,7 @@
     {
       "type": "timeseries",
       "title": "Edge bytes per minute",
-      "id": 11,
+      "id": 12,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -515,7 +565,7 @@
     {
       "type": "timeseries",
       "title": "Visits and page views per minute",
-      "id": 12,
+      "id": 13,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -570,7 +620,7 @@
     {
       "type": "bargauge",
       "title": "Requests by country (1h)",
-      "id": 13,
+      "id": 14,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -618,7 +668,7 @@
     {
       "type": "piechart",
       "title": "Cache status (1h)",
-      "id": 14,
+      "id": 15,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -660,9 +710,58 @@
       }
     },
     {
+      "type": "bargauge",
+      "title": "Hostnames failing with 530 (1h)",
+      "id": 16,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 21
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "topk(10, sum by(host) (cloudflare_zone_requests_1h_by_host_status{zone=~\"$zone\",status=\"530\"}))",
+          "legendFormat": "{{host}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "description": "These hostnames resolve to a Cloudflare Tunnel that currently has no connector. Either the tunnel is down or the DNS record still points at a decommissioned one.",
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal"
+      }
+    },
+    {
       "type": "table",
       "title": "Top hostnames \u00d7 status (1h)",
-      "id": 15,
+      "id": 17,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -671,7 +770,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 21
+        "y": 26
       },
       "targets": [
         {
@@ -741,7 +840,7 @@
     {
       "type": "bargauge",
       "title": "Edge bytes by hostname (1h)",
-      "id": 16,
+      "id": 18,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -750,7 +849,7 @@
         "h": 9,
         "w": 6,
         "x": 12,
-        "y": 21
+        "y": 26
       },
       "targets": [
         {
@@ -789,7 +888,7 @@
     {
       "type": "bargauge",
       "title": "Requests by HTTP protocol (1h)",
-      "id": 17,
+      "id": 19,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -798,7 +897,7 @@
         "h": 9,
         "w": 6,
         "x": 18,
-        "y": 21
+        "y": 26
       },
       "targets": [
         {
@@ -837,20 +936,20 @@
     {
       "type": "row",
       "title": "DNS (authoritative, dnsAnalyticsAdaptiveGroups)",
-      "id": 18,
+      "id": 20,
       "collapsed": false,
       "panels": [],
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 30
+        "y": 35
       }
     },
     {
       "type": "timeseries",
       "title": "DNS queries in the last hour",
-      "id": 19,
+      "id": 21,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -859,7 +958,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 31
+        "y": 36
       },
       "targets": [
         {
@@ -894,7 +993,7 @@
     {
       "type": "timeseries",
       "title": "DNS resolver processing time",
-      "id": 20,
+      "id": 22,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -903,7 +1002,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 31
+        "y": 36
       },
       "targets": [
         {
@@ -938,7 +1037,7 @@
     {
       "type": "piechart",
       "title": "Response codes (1h)",
-      "id": 21,
+      "id": 23,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -947,7 +1046,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 31
+        "y": 36
       },
       "targets": [
         {
@@ -983,7 +1082,7 @@
     {
       "type": "bargauge",
       "title": "Top query names (1h)",
-      "id": 22,
+      "id": 24,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -992,7 +1091,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 39
+        "y": 44
       },
       "targets": [
         {
@@ -1031,7 +1130,7 @@
     {
       "type": "bargauge",
       "title": "Query types (1h)",
-      "id": 23,
+      "id": 25,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1040,7 +1139,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 39
+        "y": 44
       },
       "targets": [
         {
@@ -1079,7 +1178,7 @@
     {
       "type": "bargauge",
       "title": "Queries by Cloudflare PoP (1h)",
-      "id": 24,
+      "id": 26,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1088,7 +1187,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 39
+        "y": 44
       },
       "targets": [
         {
@@ -1127,20 +1226,20 @@
     {
       "type": "row",
       "title": "Security (firewallEventsAdaptive, 15d retention)",
-      "id": 25,
+      "id": 27,
       "collapsed": false,
       "panels": [],
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 52
       }
     },
     {
       "type": "timeseries",
       "title": "Firewall events by action (24h rolling)",
-      "id": 26,
+      "id": 28,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1149,7 +1248,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 48
+        "y": 53
       },
       "targets": [
         {
@@ -1184,7 +1283,7 @@
     {
       "type": "bargauge",
       "title": "Firewall events by source rule set (24h)",
-      "id": 27,
+      "id": 29,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1193,7 +1292,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 48
+        "y": 53
       },
       "targets": [
         {
@@ -1232,7 +1331,7 @@
     {
       "type": "bargauge",
       "title": "Attack origin countries (24h)",
-      "id": 28,
+      "id": 30,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1241,7 +1340,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 48
+        "y": 53
       },
       "targets": [
         {
@@ -1280,7 +1379,7 @@
     {
       "type": "bargauge",
       "title": "Targeted hostnames (24h)",
-      "id": 29,
+      "id": 31,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1289,7 +1388,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 56
+        "y": 61
       },
       "targets": [
         {
@@ -1328,7 +1427,7 @@
     {
       "type": "timeseries",
       "title": "Threats per day",
-      "id": 30,
+      "id": 32,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1337,7 +1436,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 56
+        "y": 61
       },
       "targets": [
         {
@@ -1372,7 +1471,7 @@
     {
       "type": "table",
       "title": "Daily rollup (httpRequests1dGroups, 365d retention)",
-      "id": 31,
+      "id": 33,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1381,7 +1480,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 56
+        "y": 61
       },
       "targets": [
         {
@@ -1479,20 +1578,20 @@
     {
       "type": "row",
       "title": "Cloudflare Tunnels (edge view, Zero Trust API)",
-      "id": 32,
+      "id": 34,
       "collapsed": false,
       "panels": [],
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 63
+        "y": 68
       }
     },
     {
       "type": "table",
       "title": "Tunnel state",
-      "id": 33,
+      "id": 35,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1501,7 +1600,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 64
+        "y": 69
       },
       "targets": [
         {
@@ -1576,7 +1675,7 @@
     {
       "type": "timeseries",
       "title": "Active edge connections per tunnel",
-      "id": 34,
+      "id": 36,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1585,7 +1684,7 @@
         "h": 6,
         "w": 12,
         "x": 12,
-        "y": 64
+        "y": 69
       },
       "targets": [
         {
@@ -1620,20 +1719,20 @@
     {
       "type": "row",
       "title": "Exporter health",
-      "id": 35,
+      "id": 37,
       "collapsed": false,
       "panels": [],
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 70
+        "y": 75
       }
     },
     {
       "type": "stat",
       "title": "Exporter up",
-      "id": 36,
+      "id": 38,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1642,7 +1741,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 71
+        "y": 76
       },
       "targets": [
         {
@@ -1681,7 +1780,7 @@
     {
       "type": "stat",
       "title": "Collection cycle duration",
-      "id": 37,
+      "id": 39,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1690,7 +1789,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 71
+        "y": 76
       },
       "targets": [
         {
@@ -1725,7 +1824,7 @@
     {
       "type": "timeseries",
       "title": "Cloudflare API errors",
-      "id": 38,
+      "id": 40,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1734,7 +1833,7 @@
         "h": 4,
         "w": 8,
         "x": 8,
-        "y": 71
+        "y": 76
       },
       "targets": [
         {
@@ -1769,7 +1868,7 @@
     {
       "type": "stat",
       "title": "Edge data lag",
-      "id": 39,
+      "id": 41,
       "datasource": {
         "type": "prometheus",
         "uid": "${DS}"
@@ -1778,7 +1877,7 @@
         "h": 4,
         "w": 8,
         "x": 16,
-        "y": 71
+        "y": 76
       },
       "targets": [
         {
